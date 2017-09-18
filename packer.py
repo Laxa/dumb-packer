@@ -2,9 +2,11 @@
 
 from pwn import *
 from struct import unpack, pack
+import argparse
 import sys
 import os
 
+DEBUG = True
 MAGIC = '\x7f\x45\x4c\x46'
 TYPE = None
 
@@ -33,14 +35,10 @@ def parse_elf_header(data):
     elif TYPE == 32:
         return unpack('16sHHIIIIIHHHHHH', data)
 
-def main(argv):
+def main(binary):
     global TYPE
 
-    if len(argv) != 2:
-        print 'usage: %s executable' % argv[0]
-        return 1
-
-    with open(argv[1], 'rb') as f:
+    with open(binary, 'rb') as f:
         elf = f.read()
 
     context.os = 'linux'
@@ -62,7 +60,7 @@ def main(argv):
     else:
         sys.exit('[-] Type could not be identified')
 
-    ( e_ident, e_type, e_machine, e_version, e_entry, e_phoff, e_shoff, 
+    ( e_ident, e_type, e_machine, e_version, e_entry, e_phoff, e_shoff,
       e_flags, e_ehsize, e_phentsize, e_phnum, e_shentsize, e_shnum,
       e_shstrdnx ) = parse_elf_header(elf[:elf_header_size])
 
@@ -100,27 +98,41 @@ def main(argv):
 
     text_offset         = None
     text_size           = None
+    max_vaddr          = -1
     last_strtable_index = -1
-    
+
     for i in xrange(e_shnum):
         ( sh_name, sh_type, sh_flags, sh_addr, sh_offset,
           sh_size, sh_link, sh_info, sh_addralign, sh_entsize,
         ) = sections[i]
 
+        print 'Getting c_string at %#x' % (str_table_offset + sh_name)
         name = get_c_string(elf, str_table_offset + sh_name)
         if name == '.text':
             text_offset = sh_offset
             text_size   = sh_size
+            if DEBUG:
+                print '[*] Found .text offset at %#x of size %#x' % (text_offset, text_size)
 
         if sh_name + len(name) > last_strtable_index:
             last_strtable_index = sh_name + len(name)
-        
+
+        if sh_addr + sh_size > max_vaddr and sh_flags & 2 and sh_addr != 0:
+            max_vaddr = sh_addr + sh_size
+
         sections_dic[name] = s
-        print i, name, hex(sh_offset)
+
+        if DEBUG:
+            print i, name, hex(sh_offset)
+            print ( sh_name, sh_type, sh_flags, sh_addr, sh_offset,
+                    sh_size, sh_link, sh_info, sh_addralign, sh_entsize )
     
     if (text_offset == None or text_size == None):
         sys.exit('[-] Could not find .text section')
 
+    if DEBUG:
+        print '[*] Max vaddr offset: %#x' % max_vaddr
+        print '[*] last_strtable_index %#x' % last_strtable_index
     print '[*] Found .text section at %#x of size %#x' % (sh_offset, sh_size)
 
     packed = bytearray(elf)
@@ -129,10 +141,23 @@ def main(argv):
 
     # Now adding one section for our dynamic unpacker
     new_section_name = '.code\x00'
+    new_section_name_offset = last_strtable_index + str_table_offset + 1
+
+    # increasing .shstrtab size
+    if TYPE == 32:
+        shstrab_size_offset = e_shoff + (e_shstrdnx * e_shentsize) + 0x14
+        shtrab_size_size = u32(elf[shstrab_size_offset:shstrab_size_offset+4])
+        packed[shstrab_size_offset:shstrab_size_offset+4] = p32(shtrab_size_size
+         + len(new_section_name))
+    elif TYPE == 64:
+        shstrab_size_offset = e_shoff + (e_shstrdnx * e_shentsize) + 0x20
+        shtrab_size_size = u64(elf[shstrab_size_offset:shstrab_size_offset+8])
+        packed[shstrab_size_offset:shstrab_size_offset+8] = p64(shtrab_size_size
+         + len(new_section_name))
 
     # inserting our new section's name in .shstrtab
-    packed = packed[:last_strtable_index + str_table_offset + 1] + '.code\x00' \
-             + packed[last_strtable_index + str_table_offset + 1:]
+    packed = packed[:new_section_name_offset] + '.code\x00' \
+             + packed[new_section_name_offset:]
 
     # shifting by len(new_section_name) e_shoff
     # also adding one more section
@@ -157,13 +182,67 @@ def main(argv):
             offset += 0x20
             packed[offset:offset + 8] = p64(sh_size + len(new_section_name))
     
-    # TODO: add the section
-    new_section = 0
-        
-    with open(argv[1] + '.packed', 'wb') as f:
+    section_vaddr = (max_vaddr & 0xfffffffffffff000) + 0x1000
+    section_size = 0x10 # TODO: Change that
+    print '[*] New section vaddr: %#x' % section_vaddr
+
+    # adding new section
+    if TYPE == 32:
+        # sh_name
+        new_section  = p32(last_strtable_index + 1)
+        # sh_type
+        new_section += p32(1) # SHT_PROGBITS
+        # sh_flags
+        new_section += p32(6) # SHF_ALLOC | SHF_EXECINSTR
+        # sh_addr
+        new_section += p32(section_vaddr)
+        # sh_offset
+        new_section += p32(e_shentsize + len(packed))
+        # sh_size
+        new_section += p32(section_size)
+        # sh_link
+        new_section += p32(0)
+        # sh_info
+        new_section += p32(0)
+        # sh_addralign
+        new_section += p32(16)
+        # sh_entsize
+        new_section += p32(0)
+    elif TYPE == 64:
+        # sh_name
+        new_section  = p32(last_strtable_index + 1)
+        # sh_type
+        new_section += p32(1) # SHT_PROGBITS
+        # sh_flags
+        new_section += p64(6) # SHF_ALLOC | SHF_EXECINSTR
+        # sh_addr
+        new_section += p64(section_vaddr)
+        # sh_offset
+        new_section += p64(e_shentsize + len(packed))
+        # sh_size
+        new_section += p64(section_size)
+        # sh_link
+        new_section += p32(0)
+        # sh_info
+        new_section += p32(0)
+        # sh_addralign
+        new_section += p64(16)
+        # sh_entsize
+        new_section += p64(0)
+
+    packed += new_section
+    
+    # TODO: change that, bogus size for now
+    packed += '\x00' * section_size
+
+    with open(binary + '.packed', 'wb') as f:
         f.write(packed)
 
-    print '[*] packed program wrote to %s' % (argv[1] + '.packed')
+    print '[*] packed program wrote to %s' % (binary + '.packed')
 
 if __name__ == '__main__':
-    sys.exit(main(sys.argv))
+    parser = argparse.ArgumentParser()
+    parser.add_argument('binary', help='binary to pack')
+    args = parser.parse_args()
+
+    sys.exit(main(args.binary))
