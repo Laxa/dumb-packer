@@ -35,7 +35,50 @@ def parse_elf_header(data):
     elif TYPE == 32:
         return unpack('16sHHIIIIIHHHHHH', data)
 
-def main(binary):
+def get_unpacker(e_entry, text_size, xor_key):
+    e_entry_aligned = e_entry & 0xfffffffffffff000
+    test_size_aligned = text_size
+    if text_size & 0xfff:
+        test_size_aligned = (text_size & 0xfffffffffffff000) + 0x1000
+    if TYPE == 32:
+        raise NotImplementedError()
+    elif TYPE == 64:
+        unpacker = asm('''
+        push rax
+        push rdi
+        push rsi
+        push rdx
+        push rcx
+
+        mov rdi, ''' + hex(e_entry_aligned)   + '''
+        mov rsi, ''' + hex(test_size_aligned) + '''
+        mov rdx, 7
+        mov rax, 10
+        syscall
+
+        mov rdi, ''' + hex(e_entry)  + '''
+        mov rsi, rdi
+        mov rcx, ''' + hex(text_size) + '''
+
+        cld
+        decrypt:
+          lodsb
+          xor al, ''' + hex(xor_key) + '''
+          stosb
+          loop decrypt
+
+        pop rcx
+        pop rdx
+        pop rsi
+        pop rdi
+        pop rax
+
+        push ''' + hex(e_entry) + '''
+        ret
+        ''')
+    return unpacker
+
+def main(binary, xor_key):
     global TYPE
 
     with open(binary, 'rb') as f:
@@ -43,6 +86,8 @@ def main(binary):
 
     context.os = 'linux'
     context.endianness = 'little'
+    # Only supporting 1 byte key
+    xor_key &= 0xff
 
     if elf[0:4] != MAGIC:
         sys.exit('[-] ELF magic not found')
@@ -126,7 +171,7 @@ def main(binary):
             print i, name, hex(sh_offset)
             print ( sh_name, sh_type, sh_flags, sh_addr, sh_offset,
                     sh_size, sh_link, sh_info, sh_addralign, sh_entsize )
-    
+
     if (text_offset == None or text_size == None):
         sys.exit('[-] Could not find .text section')
 
@@ -137,7 +182,7 @@ def main(binary):
 
     packed = bytearray(elf)
     for i in xrange(text_size):
-        packed[text_offset + i] ^= 0xa5
+        packed[text_offset + i] ^= xor_key
 
     # Now adding one section for our dynamic unpacker
     new_section_name = '.code\x00'
@@ -181,10 +226,21 @@ def main(binary):
         elif TYPE == 64:
             offset += 0x20
             packed[offset:offset + 8] = p64(sh_size + len(new_section_name))
-    
+
+    unpacker = get_unpacker(e_entry, text_size, xor_key)
+
     section_vaddr = (max_vaddr & 0xfffffffffffff000) + 0x1000
-    section_size = 0x10 # TODO: Change that
+    section_size = len(unpacker)
     print '[*] New section vaddr: %#x' % section_vaddr
+    print '[*] Unpacker size: %#x' % section_size
+
+    # adding section_vaddr to eop
+    if TYPE == 32:
+        packed[0x18:0x1c] = p32(section_vaddr)
+    elif TYPE == 64:
+        packed[0x18:0x20] = p64(section_vaddr)
+
+    print '[*] New section code is at: %#x' % (e_shentsize + len(packed))
 
     # adding new section
     if TYPE == 32:
@@ -231,9 +287,8 @@ def main(binary):
         new_section += p64(0)
 
     packed += new_section
-    
-    # TODO: change that, bogus size for now
-    packed += '\x00' * section_size
+    # adding unpacker at the end
+    packed += unpacker
 
     with open(binary + '.packed', 'wb') as f:
         f.write(packed)
@@ -243,6 +298,8 @@ def main(binary):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('binary', help='binary to pack')
+    parser.add_argument('-k', '--key', help='byte value for xoring .txt section',
+                        default=0xa5)
     args = parser.parse_args()
 
-    sys.exit(main(args.binary))
+    sys.exit(main(args.binary, args.key))
