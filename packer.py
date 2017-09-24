@@ -109,6 +109,9 @@ def main(binary, xor_key):
       e_flags, e_ehsize, e_phentsize, e_phnum, e_shentsize, e_shnum,
       e_shstrdnx ) = parse_elf_header(elf[:elf_header_size])
 
+    if DEBUG:
+        print '[*] e_shstrdnx: %d' % e_shstrdnx
+
     if e_type != 2:
         sys.exit('[-] Binary is not an executable')
 
@@ -125,6 +128,11 @@ def main(binary, xor_key):
         ) = s
         sections.append(s)
 
+        if DEBUG:
+            for x in s:
+                sys.stdout.write(hex(x) + ', ')
+            sys.stdout.write('\n')
+
         if sh_type == 3:
             if i != e_shstrdnx:
                 continue
@@ -137,7 +145,6 @@ def main(binary, xor_key):
     text_offset         = None
     text_size           = None
     max_vaddr           = -1
-    max_section_offset  = -1
     last_strtable_index = -1
 
     for i in xrange(e_shnum):
@@ -158,24 +165,22 @@ def main(binary, xor_key):
 
         if sh_addr + sh_size > max_vaddr and sh_flags & 2 and sh_addr != 0:
             max_vaddr = sh_addr + sh_size
-        if sh_offset + sh_size > max_section_offset and sh_flags & 2 and sh_addr != 0:
-            max_section_offset = sh_offset + sh_size
         
         sections_dic[name] = s
 
         if DEBUG:
             print i, name, hex(sh_offset)
-            print ( sh_name, sh_type, sh_flags, sh_addr, sh_offset,
-                    sh_size, sh_link, sh_info, sh_addralign, sh_entsize )
+            for x in s:
+                    sys.stdout.write(hex(x) + ', ')
+            sys.stdout.write('\n')
 
     if (text_offset == None or text_size == None):
         sys.exit('[-] Could not find .text section')
 
     if DEBUG:
         print '[*] Max vaddr offset: %#x' % max_vaddr
-        print '[*] Max section offset: %#x' % max_section_offset
         print '[*] last_strtable_index %#x' % last_strtable_index
-    print '[*] Found .text section at %#x of size %#x' % (sh_offset, sh_size)
+    print '[*] Found .text section at %#x of size %#x' % (sh_offset, text_size)
 
     packed = bytearray(elf)
     for i in xrange(text_size):
@@ -184,6 +189,7 @@ def main(binary, xor_key):
     # Generating our unpacker
     new_section_name = '.code\x00'
     unpacker = get_unpacker(e_entry, text_size, xor_key)
+    new_section_offset = e_shoff + e_phentsize + len(new_section_name)
 
     section_vaddr = (max_vaddr & 0xfffffffffffff000) + 0x1000
     section_size = len(unpacker)
@@ -200,14 +206,14 @@ def main(binary, xor_key):
     # shifting by len(new_section_name) e_shoff
     # also adding one more section
     if TYPE == 32:
-        packed[0x20:0x24] = p32(e_shoff + len(new_section_name) + len(unpacker) + e_phentsize)
+        packed[0x20:0x24] = p32(new_section_offset + len(unpacker))
         packed[0x30:0x32] = p16(e_shnum + 1)
     elif TYPE == 64:
-        packed[0x28:0x30] = p64(e_shoff + len(new_section_name) + len(unpacker) + e_phentsize)
+        packed[0x28:0x30] = p64(new_section_offset + len(unpacker))
         packed[0x3c:0x3e] = p16(e_shnum + 1)
     e_shoff += len(new_section_name)
 
-    # Getting header because we will shift everything
+    # Getting headers because we will shift everything
     # We need also a new header for our .code segment
     # new layout should be like this:
     # ------------------------
@@ -227,14 +233,26 @@ def main(binary, xor_key):
     max_header_offset = None
     for i in xrange(e_phnum):
         # p_flags offset is different in 32 and 64 bits
+        target_offset = e_phoff + i * e_phentsize
         if TYPE == 32:
-            s = parse_header(elf[e_phoff + i * e_phentsize:e_phoff + (i + 1) * e_phentsize])
+            s = parse_header(elf[target_offset:target_offset + e_phentsize])
             ( p_type, p_offset, p_vaddr, p_paddr, p_filesz, p_memsz, p_flags, p_align ) = s
+            # increasing the size by e_phentsize
+            offset = s[1]
+            if offset != 0:
+                offset += e_phentsize
+            packed[target_offset + 0x4:target_offset + 0x8] = p32(offset)
         elif TYPE == 64:
-            s = parse_header(elf[e_phoff + i * e_phentsize:e_phoff + (i + 1) * e_phentsize])
+            s = parse_header(elf[target_offset:target_offset + e_phentsize])
             ( p_type, p_flags, p_offset, p_vaddr, p_paddr, p_filesz, p_memsz, p_align ) = s
+            offset = s[2]
+            if offset != 0:
+                offset += e_phentsize
+            packed[target_offset + 0x8:target_offset + 0x10] = p64(offset)
         if DEBUG:
-            print s
+            for x in s:
+                sys.stdout.write(hex(x) + ', ')
+            sys.stdout.write('\n')
         if i + 1 == e_phnum:
             max_header_offset = e_phoff + (i + 1) * e_phentsize
         headers.append(s)
@@ -246,7 +264,7 @@ def main(binary, xor_key):
         # p_type
         new_program_header += p32(1) # PT_LOAD
         # p_offset
-        new_program_header += p32(max_section_offset + len(new_section_name))
+        new_program_header += p32(new_section_offset)
         # p_vaddr
         new_program_header += p32(section_vaddr)
         # p_paddr
@@ -254,7 +272,7 @@ def main(binary, xor_key):
         # p_filesz
         new_program_header += p32(len(unpacker))
         # p_memsz
-        new_program_header += p32(len(unpacker))
+        new_program_header += p32(0x1000)
         # p_flags
         new_program_header += p32(0x5) # READ | EXECUTE
         # p_align
@@ -265,7 +283,7 @@ def main(binary, xor_key):
         # p_flags
         new_program_header += p32(5) # READ | EXECUTE
         # p_offset
-        new_program_header += p64(max_section_offset + len(new_section_name))
+        new_program_header += p64(new_section_offset)
         # p_vaddr
         new_program_header += p64(section_vaddr)
         # p_paddr
@@ -273,7 +291,7 @@ def main(binary, xor_key):
         # p_filesz
         new_program_header += p64(len(unpacker))
         # p_memsz
-        new_program_header += p64(len(unpacker))
+        new_program_header += p64(0x1000)
         # p_align
         new_program_header += p64(0x1000)
 
@@ -334,7 +352,7 @@ def main(binary, xor_key):
         # sh_addr
         new_section += p32(section_vaddr)
         # sh_offset
-        new_section += p32(e_shentsize + len(packed))
+        new_section += p32(new_section_offset)
         # sh_size
         new_section += p32(section_size)
         # sh_link
@@ -355,7 +373,7 @@ def main(binary, xor_key):
         # sh_addr
         new_section += p64(section_vaddr)
         # sh_offset
-        new_section += p64(e_shentsize + len(packed))
+        new_section += p64(new_section_offset)
         # sh_size
         new_section += p64(section_size)
         # sh_link
@@ -367,8 +385,7 @@ def main(binary, xor_key):
         # sh_entsize
         new_section += p64(0)
 
-    new_section_offset = e_shentsize + max_section_offset
-    print '[*] New section code is at: %#x' % new_section_offset
+    print '[*] New code section is at: %#x' % new_section_offset
     # adding unpacker as last section
     packed = packed[:new_section_offset] + unpacker + packed[new_section_offset:]
 
