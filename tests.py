@@ -14,4 +14,3 @@ int main(void)
 
 with open('test.c', 'w') as f:
     f.write(test)
-

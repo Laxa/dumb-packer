@@ -157,6 +157,7 @@ def main(binary, xor_key):
         if name == '.text':
             text_offset = sh_offset
             text_size   = sh_size
+            text_vaddr  = sh_addr
             if DEBUG:
                 print '[*] Found .text offset at %#x of size %#x' % (text_offset, text_size)
 
@@ -182,36 +183,51 @@ def main(binary, xor_key):
         print '[*] last_strtable_index %#x' % last_strtable_index
     print '[*] Found .text section at %#x of size %#x' % (sh_offset, text_size)
 
+    # Start of modifications of the binary
+
     packed = bytearray(elf)
     for i in xrange(text_size):
         packed[text_offset + i] ^= xor_key
 
+    unpacker = get_unpacker(e_entry, text_size, xor_key)
+    # adding unpacker to the binary
+    packed =    packed[:text_offset + text_size] + \
+                unpacker + \
+                packed[text_offset + text_size:]
+
     # Generating our unpacker
     new_section_name = '.code\x00'
-    unpacker = get_unpacker(e_entry, text_size, xor_key)
-    new_section_offset = e_shoff + e_phentsize + len(new_section_name)
+    new_section_offset = e_shoff + len(unpacker) + len(new_section_name)
 
-    section_vaddr = (max_vaddr & 0xfffffffffffff000) + 0x1000
-    section_size = len(unpacker)
-    print '[*] New section vaddr: %#x' % section_vaddr
-    print '[*] Unpacker size: %#x'     % section_size
+    packer_section_vaddr = (text_vaddr + text_size)
+    packer_section_size = len(unpacker)
+    print '[*] New section vaddr: %#x' % packer_section_vaddr
+    print '[*] Unpacker size: %#x'     % packer_section_size
 
     # Updating ELF header
     # adding section_vaddr to eop
     if TYPE == 32:
-        packed[0x18:0x1c] = p32(section_vaddr)
+        packed[0x18:0x1c] = p32(packer_section_vaddr)
     elif TYPE == 64:
-        packed[0x18:0x20] = p64(section_vaddr)
+        packed[0x18:0x20] = p64(packer_section_vaddr)
 
     # shifting by len(new_section_name) e_shoff
     # also adding one more section
     if TYPE == 32:
-        packed[0x20:0x24] = p32(new_section_offset + len(unpacker))
+        packed[0x20:0x24] = p32(new_section_offset)
         packed[0x30:0x32] = p16(e_shnum + 1)
     elif TYPE == 64:
-        packed[0x28:0x30] = p64(new_section_offset + len(unpacker))
+        packed[0x28:0x30] = p64(new_section_offset)
         packed[0x3c:0x3e] = p16(e_shnum + 1)
-    e_shoff += len(new_section_name)
+
+    # Now adding one section for our dynamic unpacker
+    new_section_name_offset = last_strtable_index + str_table_offset + 1 + len(unpacker)
+
+    # inserting our new section's name in .shstrtab
+    packed = packed[:new_section_name_offset] + '.code\x00' \
+             + packed[new_section_name_offset:]
+
+    e_shoff += len(new_section_name) + len(unpacker)
 
     # Getting headers because we will shift everything
     # We need also a new header for our .code segment
@@ -230,87 +246,46 @@ def main(binary, xor_key):
     # |our new section header|
     # ------------------------
     headers           = []
-    max_header_offset = None
+    shift = False
     for i in xrange(e_phnum):
         # p_flags offset is different in 32 and 64 bits
         target_offset = e_phoff + i * e_phentsize
         if TYPE == 32:
             s = parse_header(elf[target_offset:target_offset + e_phentsize])
             ( p_type, p_offset, p_vaddr, p_paddr, p_filesz, p_memsz, p_flags, p_align ) = s
-            # increasing the size by e_phentsize
-            offset = s[1]
-            if offset != 0:
-                offset += e_phentsize
-            packed[target_offset + 0x4:target_offset + 0x8] = p32(offset)
+            # shifting offsets for other program headers
+            if shift and p_offset > text_offset:
+                packed[target_offset + 0x4:target_offset + 0x8] = p32(p_offset + packer_section_size)
+            if shift and p_offset != 0 and (p_vaddr > code_section_vaddr and p_vaddr < code_section_maxvaddr):
+                packed[target_offset + 0x8:target_offset + 0xc] = p32(p_vaddr + packer_section_size)
+                packed[target_offset + 0xc:target_offset + 0x10] = p32(p_paddr + packer_section_size)
+            if p_flags == 0x5 and p_offset == 0:
+                print 'Found LOAD_SEGMENT for code at %#x' % (target_offset)
+                packed[target_offset + 0x10:target_offset + 0x14] = p32(p_filesz + packer_section_size)
+                packed[target_offset + 0x14:target_offset + 0x18] = p32(p_memsz + packer_section_size)
+                shift = True
+                code_section_vaddr = p_vaddr
+                code_section_maxvaddr = p_vaddr + p_align
+            
         elif TYPE == 64:
             s = parse_header(elf[target_offset:target_offset + e_phentsize])
             ( p_type, p_flags, p_offset, p_vaddr, p_paddr, p_filesz, p_memsz, p_align ) = s
-            offset = s[2]
-            if offset != 0:
-                offset += e_phentsize
-            packed[target_offset + 0x8:target_offset + 0x10] = p64(offset)
-        if DEBUG:
-            for x in s:
-                sys.stdout.write(hex(x) + ', ')
-            sys.stdout.write('\n')
-        if i + 1 == e_phnum:
-            max_header_offset = e_phoff + (i + 1) * e_phentsize
+            # shifting offsets for other program headers
+            if shift and p_offset > text_offset:
+                packed[target_offset + 0x8:target_offset + 0x10] = p64(p_offset + packer_section_size)
+            if shift and p_offset != 0 and (p_vaddr > code_section_vaddr and p_vaddr < code_section_maxvaddr):
+                packed[target_offset + 0x10:target_offset + 0x18] = p64(p_vaddr + packer_section_size)
+                packed[target_offset + 0x18:target_offset + 0x20] = p64(p_paddr + packer_section_size)
+            if p_flags == 0x5 and p_offset == 0:
+                print 'Found LOAD_SEGMENT for code at %#x' % (target_offset)
+                packed[target_offset + 0x20:target_offset + 0x28] = p64(p_filesz + packer_section_size)
+                packed[target_offset + 0x28:target_offset + 0x30] = p64(p_memsz + packer_section_size)
+                shift = True
+                code_section_vaddr = p_vaddr
+                code_section_maxvaddr = p_vaddr + p_align
+
         headers.append(s)
-    if DEBUG:
-        print '[*] Max program header at %#x' % max_header_offset
 
-    new_program_header = ''
-    if TYPE == 32:
-        # p_type
-        new_program_header += p32(1) # PT_LOAD
-        # p_offset
-        new_program_header += p32(new_section_offset)
-        # p_vaddr
-        new_program_header += p32(section_vaddr)
-        # p_paddr
-        new_program_header += p32(section_vaddr)
-        # p_filesz
-        new_program_header += p32(len(unpacker))
-        # p_memsz
-        new_program_header += p32(0x1000)
-        # p_flags
-        new_program_header += p32(0x5) # READ | EXECUTE
-        # p_align
-        new_program_header += p64(0x1000)
-    elif TYPE == 64:
-        # p_type
-        new_program_header += p32(1) # PT_LOAD
-        # p_flags
-        new_program_header += p32(5) # READ | EXECUTE
-        # p_offset
-        new_program_header += p64(new_section_offset)
-        # p_vaddr
-        new_program_header += p64(section_vaddr)
-        # p_paddr
-        new_program_header += p64(section_vaddr)
-        # p_filesz
-        new_program_header += p64(len(unpacker))
-        # p_memsz
-        new_program_header += p64(0x1000)
-        # p_align
-        new_program_header += p64(0x1000)
-
-    # adding our new program header
-    packed = packed[:max_header_offset] + new_program_header + packed[max_header_offset:]
-    # increasing e_phnum
-    if TYPE == 32:
-        packed[0x2c:0x2e] = p16(e_phnum + 1)
-    elif TYPE == 64:
-        packed[0x38:0x3a] = p16(e_phnum + 1)
-
-    # Now adding one section for our dynamic unpacker
-    new_section_name_offset = last_strtable_index + str_table_offset + 1 + e_phentsize
-    # increasing e_shoff for following operations
-    e_shoff += e_phentsize
-
-    # inserting our new section's name in .shstrtab
-    packed = packed[:new_section_name_offset] + '.code\x00' \
-             + packed[new_section_name_offset:]
 
     # increasing .shstrtab size
     if TYPE == 32:
@@ -350,11 +325,11 @@ def main(binary, xor_key):
         # sh_flags
         new_section += p32(6) # SHF_ALLOC | SHF_EXECINSTR
         # sh_addr
-        new_section += p32(section_vaddr)
+        new_section += p32(packer_section_vaddr)
         # sh_offset
         new_section += p32(new_section_offset)
         # sh_size
-        new_section += p32(section_size)
+        new_section += p32(packer_section_size)
         # sh_link
         new_section += p32(0)
         # sh_info
@@ -371,11 +346,11 @@ def main(binary, xor_key):
         # sh_flags
         new_section += p64(6) # SHF_ALLOC | SHF_EXECINSTR
         # sh_addr
-        new_section += p64(section_vaddr)
+        new_section += p64(packer_section_vaddr)
         # sh_offset
         new_section += p64(new_section_offset)
         # sh_size
-        new_section += p64(section_size)
+        new_section += p64(packer_section_size)
         # sh_link
         new_section += p32(0)
         # sh_info
