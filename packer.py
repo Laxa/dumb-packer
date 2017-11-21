@@ -158,6 +158,7 @@ def main(binary, xor_key):
             text_offset = sh_offset
             text_size   = sh_size
             text_vaddr  = sh_addr
+            text_section_index = i
             if DEBUG:
                 print '[*] Found .text offset at %#x of size %#x' % (text_offset, text_size)
 
@@ -191,15 +192,17 @@ def main(binary, xor_key):
 
     unpacker = get_unpacker(e_entry, text_size, xor_key)
     # adding unpacker to the binary
-    packed =    packed[:text_offset + text_size] + \
+    unpacker_offset = text_offset + text_size
+    packed =    packed[:unpacker_offset] + \
                 unpacker + \
-                packed[text_offset + text_size:]
+                packed[unpacker_offset:]
 
     # Generating our unpacker
     new_section_name = '.code\x00'
-    new_section_offset = e_shoff + len(unpacker) + len(new_section_name)
+    new_section_offset =    e_shoff + e_shentsize * (text_section_index + 1) + \
+                            len(unpacker) + len(new_section_name)
 
-    packer_section_vaddr = (text_vaddr + text_size)
+    packer_section_vaddr = text_vaddr + text_size
     packer_section_size = len(unpacker)
     print '[*] New section vaddr: %#x' % packer_section_vaddr
     print '[*] Unpacker size: %#x'     % packer_section_size
@@ -211,14 +214,21 @@ def main(binary, xor_key):
     elif TYPE == 64:
         packed[0x18:0x20] = p64(packer_section_vaddr)
 
+    e_shoff += len(new_section_name) + len(unpacker)
     # shifting by len(new_section_name) e_shoff
     # also adding one more section
     if TYPE == 32:
-        packed[0x20:0x24] = p32(new_section_offset)
+        packed[0x20:0x24] = p32(e_shoff)
         packed[0x30:0x32] = p16(e_shnum + 1)
     elif TYPE == 64:
-        packed[0x28:0x30] = p64(new_section_offset)
+        packed[0x28:0x30] = p64(e_shoff)
         packed[0x3c:0x3e] = p16(e_shnum + 1)
+
+    if (text_section_index + 1 < e_shstrdnx):
+        if TYPE == 32:
+            packed[0x32:0x36] = p16(e_shstrdnx + 1)
+        elif TYPE == 64:
+            packed[0x3e:0x40] = p16(e_shstrdnx + 1)
 
     # Now adding one section for our dynamic unpacker
     new_section_name_offset = last_strtable_index + str_table_offset + 1 + len(unpacker)
@@ -227,8 +237,6 @@ def main(binary, xor_key):
     packed = packed[:new_section_name_offset] + '.code\x00' \
              + packed[new_section_name_offset:]
 
-    e_shoff += len(new_section_name) + len(unpacker)
-
     # Getting headers because we will shift everything
     # We need also a new header for our .code segment
     # new layout should be like this:
@@ -236,11 +244,12 @@ def main(binary, xor_key):
     # |      ELF Header      |
     # ------------------------
     # |   program Headers    |
-    # |  new program header  |
     # ------------------------
-    # |       sections       |
+    # |  sections til text   |
     # ------------------------
     # |    our new section   |
+    # ------------------------
+    # |   rest of sections   |
     # ------------------------
     # |    section headers   |
     # |our new section header|
@@ -286,7 +295,6 @@ def main(binary, xor_key):
 
         headers.append(s)
 
-
     # increasing .shstrtab size
     if TYPE == 32:
         shstrab_size_offset = e_shoff + (e_shstrdnx * e_shentsize) + 0x14
@@ -300,21 +308,34 @@ def main(binary, xor_key):
          + len(new_section_name))
 
     # moving other sections of len(new_section_name)
-    for i in xrange(0, e_shnum):
+    for i in xrange(text_section_index + 1, e_shnum):
         ( sh_name, sh_type, sh_flags, sh_addr, sh_offset,
           sh_size, sh_link, sh_info, sh_addralign, sh_entsize,
         ) = sections[i]
-        new_offset = sh_offset + e_phentsize
+        new_offset = sh_offset + len(unpacker)
+        new_vaddr = sh_addr
+        if (sh_addr != 0 and sh_addr < code_section_maxvaddr):
+            new_vaddr += len(unpacker)
         # for section after .shstrtab, we also increase by new_section_name
         if i > e_shstrdnx:
             new_offset += len(new_section_name)
         offset = e_shoff + e_shentsize * i
         if TYPE == 32:
-            offset += 0x10
+            offset += 0xc
+            packed[offset:offset + 4] = p32(new_vaddr)
+            offset += 0x4
             packed[offset:offset + 4] = p32(new_offset)
+            if sh_link > text_section_index:
+                offset += 0x8
+                packed[offset:offset + 4] = p32(sh_link + 1)
         elif TYPE == 64:
-            offset += 0x18
+            offset += 0x10
+            packed[offset:offset + 8] = p64(new_vaddr)
+            offset += 0x8
             packed[offset:offset + 8] = p64(new_offset)
+            if sh_link > text_section_index:
+                offset += 0x10
+                packed[offset:offset + 4] = p32(sh_link + 1)
 
     # adding new section
     if TYPE == 32:
@@ -327,7 +348,7 @@ def main(binary, xor_key):
         # sh_addr
         new_section += p32(packer_section_vaddr)
         # sh_offset
-        new_section += p32(new_section_offset)
+        new_section += p32(unpacker_offset)
         # sh_size
         new_section += p32(packer_section_size)
         # sh_link
@@ -348,7 +369,7 @@ def main(binary, xor_key):
         # sh_addr
         new_section += p64(packer_section_vaddr)
         # sh_offset
-        new_section += p64(new_section_offset)
+        new_section += p64(unpacker_offset)
         # sh_size
         new_section += p64(packer_section_size)
         # sh_link
@@ -361,11 +382,8 @@ def main(binary, xor_key):
         new_section += p64(0)
 
     print '[*] New code section is at: %#x' % new_section_offset
-    # adding unpacker as last section
-    packed = packed[:new_section_offset] + unpacker + packed[new_section_offset:]
-
-    # adding our section
-    packed += new_section
+    # adding unpacker section
+    packed = packed[:new_section_offset] + new_section + packed[new_section_offset:]
 
     with open(binary + '.packed', 'wb') as f:
         f.write(packed)
